@@ -370,6 +370,36 @@ class MProviderBridged {
             return '';
           }),
     );
+    interpreter.registertopLevelFunction(
+      'evaluateJavascriptViaWebviewWithResourceCapture',
+      (visitor, positionalArgs, namedArgs, _) => http
+          .post(
+            Uri.parse(
+              'http://localhost:$cfPort'
+              '/evaluateJavascriptViaWebviewWithResourceCapture',
+            ),
+            headers: {HttpHeaders.contentTypeHeader: 'application/json'},
+            body: jsonEncode({
+              'url': positionalArgs[0] as String,
+              'headers': (positionalArgs[1] as Map).cast<String, String>(),
+              'scripts': (positionalArgs[2] as List).cast(),
+              'time': positionalArgs.length > 3 && positionalArgs[3] != null
+                  ? positionalArgs[3] as int
+                  : 30,
+              if (positionalArgs.length > 4 && positionalArgs[4] != null)
+                'capture': (positionalArgs[4] as Map).cast<String, dynamic>(),
+            }),
+          )
+          .then((res) {
+            if (res.statusCode == 200) {
+              return jsonDecode(res.body) as Map<String, dynamic>;
+            }
+            return <String, dynamic>{
+              'status': 'error',
+              'error': 'HTTP ${res.statusCode}',
+            };
+          }),
+    );
     interpreter.registertopLevelFunction('print', (
       visitor,
       positionalArgs,

@@ -8,6 +8,7 @@ import 'package:mangayomi/eval/model/m_bridge.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:ui' show Size;
 
 import 'package:mangayomi/eval/model/m_source.dart';
 import 'package:mangayomi/repositories/settings_repository.dart';
@@ -18,6 +19,7 @@ import 'package:http/io_client.dart';
 import 'package:mangayomi/services/http/rhttp/src/model/settings.dart';
 import 'package:mangayomi/utils/log/log.dart';
 import 'package:mangayomi/services/http/rhttp/rhttp.dart' as rhttp;
+import 'package:mangayomi/services/http/webview_resource_capture.dart';
 import 'package:mangayomi/services/http/doh/doh_resolver.dart';
 import 'package:mangayomi/services/http/doh/doh_providers.dart';
 import 'package:mangayomi/services/http/doh/doh_custom_store.dart';
@@ -584,6 +586,10 @@ Future<void> webviewServer() async {
         } else if (request.method == 'POST' &&
             request.uri.path == '/evaluateJavascriptViaWebview') {
           _evaluateJavascriptViaWebview(request);
+        } else if (request.method == 'POST' &&
+            request.uri.path ==
+                '/evaluateJavascriptViaWebviewWithResourceCapture') {
+          _evaluateJavascriptViaWebviewWithResourceCapture(request);
         } else {
           request.response
             ..statusCode = HttpStatus.notFound
@@ -789,5 +795,228 @@ Future<void> _evaluateJavascriptViaWebview(HttpRequest request) async {
       ..statusCode = HttpStatus.badRequest
       ..write(jsonEncode({'error': 'Invalid JSON'}))
       ..close();
+  }
+}
+
+/// Opens [url], runs the page scripts, and records resource requests that
+/// arrive while they run. Returns a structured result to the extension
+/// bridge; the existing `_evaluateJavascriptViaWebview` is untouched.
+///
+/// `onLoadResource` is the non-invasive observer on Android, iOS, macOS and
+/// Linux. The Windows plugin does not implement that callback, so there the
+/// WebResourceRequested handler is used instead: it observes every request
+/// and returns null, leaving the response untouched. Android's equivalent
+/// handler is deliberately not enabled because it blocks each request on a
+/// Dart round-trip.
+Future<void> _evaluateJavascriptViaWebviewWithResourceCapture(
+  HttpRequest request,
+) async {
+  final stopwatch = Stopwatch()..start();
+  flutter_inappwebview.HeadlessInAppWebView? headlessWebView;
+  Timer? settleTimer;
+  Timer? deadlineTimer;
+
+  try {
+    final body = await utf8.decoder.bind(request).join();
+    final data = jsonDecode(body) as Map<String, dynamic>;
+    final url = data['url'] as String;
+    final headers =
+        (data['headers'] as Map<String, dynamic>?)?.map(
+          (key, value) => MapEntry(key, value.toString()),
+        ) ??
+        {};
+    final scripts =
+        (data['scripts'] as List<dynamic>?)
+            ?.map((value) => value.toString())
+            .toList() ??
+        [];
+    final seconds = ((data['time'] as int?) ?? 30).clamp(1, 120).toInt();
+    final captureJson = data['capture'];
+    final config = WebviewResourceCaptureConfig.fromJson(
+      captureJson is Map<String, dynamic> ? captureJson : null,
+    );
+    final capture = WebviewResourceCapture(config);
+    // Android injects plugin scripts with evaluateJavascript, which only runs
+    // in the main frame, so onLoadResource never sees an iframe. Windows has
+    // no onLoadResource implementation at all. Both use the native request
+    // callback, returning null so the response is unchanged.
+    final useRequestInterception = Platform.isAndroid || Platform.isWindows;
+
+    final done = Completer<void>();
+    var scriptsFinished = scripts.isEmpty;
+    var deadlineReached = false;
+    var scriptResult = '';
+    String? error;
+    var pageUrl = url;
+
+    void finish() {
+      if (!done.isCompleted) done.complete();
+    }
+
+    void scheduleSettle() {
+      if (!scriptsFinished || done.isCompleted) return;
+      settleTimer?.cancel();
+      if (config.settleMs <= 0) {
+        finish();
+        return;
+      }
+      settleTimer = Timer(Duration(milliseconds: config.settleMs), finish);
+    }
+
+    void onResource(
+      String? resourceUrl, {
+      required String source,
+      String? initiatorType,
+      bool? isForMainFrame,
+      double? startTime,
+      double? duration,
+    }) {
+      final added = capture.add(
+        url: resourceUrl,
+        source: source,
+        initiatorType: initiatorType,
+        isForMainFrame: isForMainFrame,
+        startTime: startTime,
+        duration: duration,
+      );
+      if (!added) return;
+
+      if (kDebugMode) {
+        debugPrint('[webview-capture] $source ${redactUrlForLog(resourceUrl)}');
+      }
+      if (config.stopOnFirstMatch) {
+        finish();
+      } else {
+        scheduleSettle();
+      }
+    }
+
+    headlessWebView = flutter_inappwebview.HeadlessInAppWebView(
+      webViewEnvironment: webViewEnvironment,
+      initialSize: const Size(1280, 800),
+      initialSettings: flutter_inappwebview.InAppWebViewSettings(
+        useOnLoadResource: !useRequestInterception,
+      ),
+      onWebViewCreated: (controller) {
+        controller.addJavaScriptHandler(
+          handlerName: 'setResponse',
+          callback: (args) {
+            scriptResult = args.isNotEmpty ? args.first.toString() : '';
+            scriptsFinished = true;
+            scheduleSettle();
+          },
+        );
+      },
+      initialUrlRequest: flutter_inappwebview.URLRequest(
+        url: flutter_inappwebview.WebUri(url),
+        headers: headers,
+      ),
+      onLoadStart: (controller, currentUrl) {
+        if (currentUrl != null) pageUrl = currentUrl.toString();
+      },
+      onLoadStop: (controller, currentUrl) async {
+        if (currentUrl != null) pageUrl = currentUrl.toString();
+        if (scripts.isEmpty) {
+          scriptsFinished = true;
+          scheduleSettle();
+          return;
+        }
+        for (final script in scripts) {
+          try {
+            await controller.platform.evaluateJavascript(source: script);
+          } catch (e) {
+            error ??= e.toString();
+            scriptsFinished = true;
+            scheduleSettle();
+          }
+        }
+      },
+      onLoadResource: useRequestInterception
+          ? null
+          : (controller, resource) {
+              onResource(
+                resource.url?.toString(),
+                source: 'onLoadResource',
+                initiatorType: resource.initiatorType,
+                startTime: resource.startTime,
+                duration: resource.duration,
+              );
+            },
+      shouldInterceptRequest: useRequestInterception
+          ? (controller, webRequest) {
+              onResource(
+                webRequest.url.toString(),
+                source: 'shouldInterceptRequest',
+                isForMainFrame: webRequest.isForMainFrame,
+              );
+              return null;
+            }
+          : null,
+      onReceivedError: (controller, webRequest, resourceError) {
+        if (webRequest.isForMainFrame == true) {
+          error ??= resourceError.description;
+        }
+      },
+    );
+
+    await headlessWebView.run();
+    deadlineTimer = Timer(Duration(seconds: seconds), () {
+      deadlineReached = true;
+      finish();
+    });
+    await done.future;
+
+    final status = deadlineReached && !scriptsFinished
+        ? 'timeout'
+        : (error != null && capture.resources.isEmpty ? 'error' : 'ok');
+
+    if (kDebugMode) {
+      debugPrint(
+        '[webview-capture] status=$status '
+        'resources=${capture.resources.length} '
+        'elapsed=${stopwatch.elapsedMilliseconds}ms',
+      );
+    }
+
+    request.response
+      ..headers.contentType = ContentType.json
+      ..write(
+        jsonEncode({
+          'status': status,
+          'url': pageUrl,
+          'result': scriptResult,
+          'resources': capture.resources,
+          'truncated': capture.truncated,
+          'scriptsFinished': scriptsFinished,
+          'platform': Platform.operatingSystem,
+          'elapsedMs': stopwatch.elapsedMilliseconds,
+          'error': error,
+        }),
+      )
+      ..close();
+  } catch (e) {
+    request.response
+      ..statusCode = HttpStatus.badRequest
+      ..headers.contentType = ContentType.json
+      ..write(
+        jsonEncode({
+          'status': 'error',
+          'url': '',
+          'result': '',
+          'resources': <Map<String, dynamic>>[],
+          'truncated': false,
+          'scriptsFinished': false,
+          'platform': Platform.operatingSystem,
+          'elapsedMs': stopwatch.elapsedMilliseconds,
+          'error': e.toString(),
+        }),
+      )
+      ..close();
+  } finally {
+    settleTimer?.cancel();
+    deadlineTimer?.cancel();
+    try {
+      await headlessWebView?.dispose();
+    } catch (_) {}
   }
 }

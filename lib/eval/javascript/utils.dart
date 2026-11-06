@@ -160,6 +160,13 @@ async function evaluateJavascriptViaWebview(url, headers, scripts, time = 30) {
         JSON.stringify([url, headers, scripts, time])
     );
 }
+async function evaluateJavascriptViaWebviewWithResourceCapture(url, headers, scripts, time = 30, capture = {}) {
+    const raw = await sendMessage(
+        "evaluateJavascriptViaWebviewWithResourceCapture",
+        JSON.stringify([url, headers, scripts, time, capture])
+    );
+    return raw ? JSON.parse(raw) : null;
+}
 async function createHlsProxyUrl(url, headers = {}) {
     return await sendMessage(
         "createHlsProxyUrl",
